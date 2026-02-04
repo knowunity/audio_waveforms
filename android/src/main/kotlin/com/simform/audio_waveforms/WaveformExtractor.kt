@@ -10,6 +10,7 @@ import android.util.Log
 import io.flutter.plugin.common.MethodChannel
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.pow
 import kotlin.math.sqrt
 import androidx.core.net.toUri
@@ -68,6 +69,8 @@ class WaveformExtractor(
     private var perSamplePoints = 0L
     /** Flag to prevent submitting multiple results */
     private var isReplySubmitted = false
+    /** Flag to ensure stop is only executed once */
+    private val isStopped = AtomicBoolean(false)
 
     /**
      * Retrieves the audio format from the given media file
@@ -121,7 +124,7 @@ class WaveformExtractor(
                 it.configure(format, null, null, 0)
                 it.setCallback(object : MediaCodec.Callback() {
                     override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-                        if (inputEof || index < 0) return
+                        if (isStopped.get() || inputEof || index < 0) return
                         val extractor = extractor ?: return
                         codec.getInputBuffer(index)?.let { buf ->
                             val size = extractor.readSampleData(buf, 0)
@@ -189,7 +192,7 @@ class WaveformExtractor(
                         index: Int,
                         info: MediaCodec.BufferInfo
                     ) {
-                        if (index < 0 || decoder == null) return
+                        if (isStopped.get() || index < 0 || decoder == null) return
                         
                         try {
                             if (info.size > 0) {
@@ -400,11 +403,38 @@ class WaveformExtractor(
      * 1. Stops and releases the MediaCodec decoder
      * 2. Releases the MediaExtractor
      * 3. Signals completion via the countdown latch
+     *
+     * Thread-safe: Uses atomic flag to ensure stop is only executed once,
+     * preventing "codec is released already" exceptions.
      */
     fun stop() {
-        decoder?.stop()
-        decoder?.release()
-        extractor?.release()
+        if (!isStopped.compareAndSet(false, true)) {
+            return
+        }
+
+        val localDecoder = decoder
+        val localExtractor = extractor
+        decoder = null
+        extractor = null
+
+        try {
+            localDecoder?.stop()
+        } catch (e: IllegalStateException) {
+            Log.w(Constants.LOG_TAG, "Decoder already stopped: ${e.message}")
+        }
+
+        try {
+            localDecoder?.release()
+        } catch (e: IllegalStateException) {
+            Log.w(Constants.LOG_TAG, "Decoder already released: ${e.message}")
+        }
+
+        try {
+            localExtractor?.release()
+        } catch (e: IllegalStateException) {
+            Log.w(Constants.LOG_TAG, "Extractor already released: ${e.message}")
+        }
+
         finishCount.countDown()
     }
 }
