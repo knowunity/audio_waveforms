@@ -2,7 +2,7 @@
 
 - Feature [#468](https://github.com/SimformSolutionsPvtLtd/audio_waveforms/pull/468) - Add macOS support
 - Chore [#509](https://github.com/SimformSolutionsPvtLtd/audio_waveforms/issues/509) - Migrate Android playback from ExoPlayer 2.17.1 to Media3 1.11.0
-- **BREAKING:** Feature [#492](https://github.com/SimformSolutionsPvtLtd/audio_waveforms/issues/492) - Add Swift Package Manager support for iOS and macOS
+- **BREAKING:** Feature [#492](https://github.com/SimformSolutionsPvtLtd/audio_waveforms/issues/492) - Add Swift Package Manager support for iOS and macOS. Requires Flutter `>=3.41.0` and Dart `^3.11.0` (`FlutterFramework` Swift package).
 
 ## 2.0.2
 
