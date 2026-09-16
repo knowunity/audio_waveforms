@@ -305,7 +305,11 @@ class AudioWaveformsPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     override fun onDetachedFromActivity() {
         recorder?.release()
         recorder = null
+        audioPlayers.values.forEach { it?.stop() }
         audioPlayers.clear()
+        // Dropping an in-flight extractor leaves its MediaCodec/MediaExtractor to be released by
+        // the finalizer, which races the decode callbacks and kills the process.
+        extractors.values.forEach { it?.stop() }
         extractors.clear()
         activity = null
         if (pluginBinding != null) {
