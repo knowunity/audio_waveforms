@@ -264,6 +264,9 @@ class AudioWaveformsPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             result.error(Constants.LOG_TAG, "Path can't be null", "")
             return
         }
+        // Finished extractors are never taken out of the map otherwise: it grows by one entry per
+        // extraction, each holding a MediaCodec and a MediaExtractor that can never be collected.
+        extractors.entries.removeAll { it.value?.hasStopped != false }
         extractors[playerKey]?.stop()
         extractors[playerKey] = WaveformExtractor(
             context = applicationContext,
@@ -305,7 +308,11 @@ class AudioWaveformsPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     override fun onDetachedFromActivity() {
         recorder?.release()
         recorder = null
+        audioPlayers.values.forEach { it?.stop() }
         audioPlayers.clear()
+        // Dropping an in-flight extractor leaves its MediaCodec/MediaExtractor to be released by
+        // the finalizer, which races the decode callbacks and kills the process.
+        extractors.values.forEach { it?.stop() }
         extractors.clear()
         activity = null
         if (pluginBinding != null) {

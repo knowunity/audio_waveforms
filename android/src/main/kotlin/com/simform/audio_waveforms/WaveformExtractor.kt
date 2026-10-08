@@ -73,6 +73,21 @@ class WaveformExtractor(
     /** Flag to ensure stop is only executed once */
     private val isStopped = AtomicBoolean(false)
 
+    /** Whether [stop] has already released the decoder and the extractor. */
+    val hasStopped: Boolean get() = isStopped.get()
+
+    /**
+     * Guards every use of [decoder] / [extractor] against a concurrent release.
+     *
+     * MediaCodec callbacks are dispatched on the looper of the thread that created the codec,
+     * while a release can come from another thread entirely (the platform reclaiming the codec
+     * under resource pressure, a finalizer, or a stop() from the plugin). Without this lock the
+     * `isStopped` check is a check-then-use: the codec can be released between the check and
+     * `getInputBuffer`/`readSampleData`, which is fatal (IllegalStateException, or a SIGSEGV
+     * inside NuMediaExtractor::readSampleData writing into the freed input buffer).
+     */
+    private val lock = Any()
+
     /**
      * Retrieves the audio format from the given media file
      *
@@ -125,37 +140,43 @@ class WaveformExtractor(
                 it.configure(format, null, null, 0)
                 it.setCallback(object : MediaCodec.Callback() {
                     override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
+                      synchronized(lock) {
                         if (isStopped.get() || inputEof || index < 0) return
                         val extractor = extractor ?: return
-                        codec.getInputBuffer(index)?.let { buf ->
-                            val size = extractor.readSampleData(buf, 0)
-                            val sampleTime = extractor.sampleTime
-                            if (size > 0 && sampleTime >= 0) {
-                                try {
+                        try {
+                            codec.getInputBuffer(index)?.let { buf ->
+                                val size = extractor.readSampleData(buf, 0)
+                                val sampleTime = extractor.sampleTime
+                                if (size > 0 && sampleTime >= 0) {
                                     codec.queueInputBuffer(index, 0, size, sampleTime, 0)
                                     extractor.advance()
-                                } catch (e: Exception) {
-                                    inputEof = true
-                                    result.error(
-                                        Constants.LOG_TAG,
-                                        e.message,
-                                        "Invalid input buffer."
+                                } else {
+                                    codec.queueInputBuffer(
+                                        index,
+                                        0,
+                                        0,
+                                        0,
+                                        MediaCodec.BUFFER_FLAG_END_OF_STREAM
                                     )
+                                    inputEof = true
                                 }
-                            } else {
-                                codec.queueInputBuffer(
-                                    index,
-                                    0,
-                                    0,
-                                    0,
-                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                                )
-                                inputEof = true
+                            }
+                        } catch (e: IllegalStateException) {
+                            // The codec was released or reclaimed underneath us.
+                            inputEof = true
+                            Log.w(Constants.LOG_TAG, "Input buffer unavailable: ${e.message}")
+                        } catch (e: Exception) {
+                            inputEof = true
+                            if (!isReplySubmitted) {
+                                isReplySubmitted = true
+                                result.error(Constants.LOG_TAG, e.message, "Invalid input buffer.")
                             }
                         }
+                      }
                     }
 
                     override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
+                      synchronized(lock) {
                         sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                         channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                         pcmEncodingBit = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -174,6 +195,7 @@ class WaveformExtractor(
                         }
                         totalSamples = (sampleRate.toLong() * durationMillis) / 1000
                         perSamplePoints = totalSamples / expectedPoints
+                      }
                     }
 
                     override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
@@ -184,8 +206,8 @@ class WaveformExtractor(
                                 "An error is thrown while decoding the audio file"
                             )
                             isReplySubmitted = true
-                            finishCount.countDown()
                         }
+                        stop()
                     }
 
                     override fun onOutputBufferAvailable(
@@ -193,6 +215,7 @@ class WaveformExtractor(
                         index: Int,
                         info: MediaCodec.BufferInfo
                     ) {
+                      synchronized(lock) {
                         if (isStopped.get() || index < 0 || decoder == null) return
                         
                         try {
@@ -238,6 +261,7 @@ class WaveformExtractor(
                             sendProgress(rms)
                             stop()
                         }
+                      }
                     }
 
                 })
@@ -411,31 +435,33 @@ class WaveformExtractor(
      * preventing "codec is released already" exceptions.
      */
     fun stop() {
-        if (!isStopped.compareAndSet(false, true)) {
-            return
-        }
+        synchronized(lock) {
+            if (!isStopped.compareAndSet(false, true)) {
+                return
+            }
 
-        val localDecoder = decoder
-        val localExtractor = extractor
-        decoder = null
-        extractor = null
+            val localDecoder = decoder
+            val localExtractor = extractor
+            decoder = null
+            extractor = null
 
-        try {
-            localDecoder?.stop()
-        } catch (e: IllegalStateException) {
-            Log.w(Constants.LOG_TAG, "Decoder already stopped: ${e.message}")
-        }
+            try {
+                localDecoder?.stop()
+            } catch (e: IllegalStateException) {
+                Log.w(Constants.LOG_TAG, "Decoder already stopped: ${e.message}")
+            }
 
-        try {
-            localDecoder?.release()
-        } catch (e: IllegalStateException) {
-            Log.w(Constants.LOG_TAG, "Decoder already released: ${e.message}")
-        }
+            try {
+                localDecoder?.release()
+            } catch (e: IllegalStateException) {
+                Log.w(Constants.LOG_TAG, "Decoder already released: ${e.message}")
+            }
 
-        try {
-            localExtractor?.release()
-        } catch (e: IllegalStateException) {
-            Log.w(Constants.LOG_TAG, "Extractor already released: ${e.message}")
+            try {
+                localExtractor?.release()
+            } catch (e: IllegalStateException) {
+                Log.w(Constants.LOG_TAG, "Extractor already released: ${e.message}")
+            }
         }
 
         finishCount.countDown()
