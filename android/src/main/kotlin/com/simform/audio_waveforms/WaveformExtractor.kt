@@ -73,6 +73,9 @@ class WaveformExtractor(
     /** Flag to ensure stop is only executed once */
     private val isStopped = AtomicBoolean(false)
 
+    /** Whether [stop] has already released the decoder and the extractor. */
+    val hasStopped: Boolean get() = isStopped.get()
+
     /**
      * Guards every use of [decoder] / [extractor] against a concurrent release.
      *

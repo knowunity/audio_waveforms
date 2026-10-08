@@ -264,6 +264,9 @@ class AudioWaveformsPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             result.error(Constants.LOG_TAG, "Path can't be null", "")
             return
         }
+        // Finished extractors are never taken out of the map otherwise: it grows by one entry per
+        // extraction, each holding a MediaCodec and a MediaExtractor that can never be collected.
+        extractors.entries.removeAll { it.value?.hasStopped != false }
         extractors[playerKey]?.stop()
         extractors[playerKey] = WaveformExtractor(
             context = applicationContext,
