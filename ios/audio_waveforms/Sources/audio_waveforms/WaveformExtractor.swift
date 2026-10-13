@@ -53,9 +53,16 @@ public class WaveformExtractor {
         
         /// Prevent division by zero, + minimum resolution
         let samplesPerPixel = max(1, samplesPerPixel ?? 100)
-        let currentFrame = audioFile.framePosition
         let totalFrames = AVAudioFrameCount(audioFile.length)
         var framesPerBuffer = totalFrames / AVAudioFrameCount(samplesPerPixel)
+        
+        if framesPerBuffer == 0 {
+            sendErrorToFlutter(
+                message: "Audio file is too short for the requested number of samples.",
+                details: "\(totalFrames) frames for \(samplesPerPixel) samples"
+            )
+            return
+        }
         
         guard let rmsBuffer = AVAudioPCMBuffer(
             pcmFormat: audioFile.processingFormat,
@@ -68,6 +75,10 @@ public class WaveformExtractor {
             size: samplesPerPixel
         )
         
+        /// Accessing `framePosition` raises an Objective-C exception, which Swift cannot catch, for files
+        /// AVAudioFile can open but not position (e.g. fragmented MP4 from Safari's MediaRecorder). Reads are
+        /// consecutive, so only touch it when resuming from the current position or starting at an offset.
+        let currentFrame: AVAudioFramePosition = offset == nil ? audioFile.framePosition : 0
         let startIndex = max(
             0, offset ?? Int(currentFrame / Int64(framesPerBuffer))
         )
@@ -87,15 +98,17 @@ public class WaveformExtractor {
         ? currentFrame
         : Int64(startIndex * Int(framesPerBuffer))
         
+        if offset != nil, startFrame != 0 {
+            audioFile.framePosition = startFrame
+        }
+        
         for i in startIndex..<endIndex {
             if abortGetWaveformData {
-                audioFile.framePosition = currentFrame
                 abortGetWaveformData = false
                 return
             }
             
             do {
-                audioFile.framePosition = startFrame
                 try audioFile.read(into: rmsBuffer, frameCount: framesPerBuffer)
             } catch {
                 sendErrorToFlutter(
@@ -132,7 +145,6 @@ public class WaveformExtractor {
             }
         }
         
-        audioFile.framePosition = currentFrame
         let waveformData = await waveformStorage.getData()
         let data = getChannelMean(data: waveformData)
         onExtractionComplete(data);
