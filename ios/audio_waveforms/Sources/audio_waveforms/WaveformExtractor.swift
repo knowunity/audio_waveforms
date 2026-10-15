@@ -51,6 +51,16 @@ public class WaveformExtractor {
     ) async -> Void {
         guard let audioFile = audioFile else { return }
         
+        /// AVAudioFile can't position or decode files without a fixed frame count per packet, such as Opus in MP4
+        /// (Chrome's MediaRecorder output), and `framePosition` raises an Objective-C exception Swift can't catch.
+        if audioFile.fileFormat.streamDescription.pointee.mFramesPerPacket == 0 {
+            sendErrorToFlutter(
+                message: "Can't extract waveform data from this audio format.",
+                details: audioFile.fileFormat.description
+            )
+            return
+        }
+
         /// Prevent division by zero, + minimum resolution
         let samplesPerPixel = max(1, samplesPerPixel ?? 100)
         let currentFrame = audioFile.framePosition
