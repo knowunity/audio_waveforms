@@ -33,7 +33,7 @@ public class WaveformExtractor {
             audioFile = try AVAudioFile(forReading: url)
         } catch {
             audioFile = nil
-            result(FlutterError(code: Constants.audioWaveforms, message: error.localizedDescription, details: "Couldn't initialise AVAudioFile from \(url.absoluteString)"))
+            result(FlutterError(code: Constants.audioWaveforms, message: error.localizedDescription, details: "Couldn't initialise AVAudioFile from \(url.absoluteString): \(error)"))
 
         }
     }
@@ -56,7 +56,8 @@ public class WaveformExtractor {
         if audioFile.fileFormat.streamDescription.pointee.mFramesPerPacket == 0 {
             sendErrorToFlutter(
                 message: "Can't extract waveform data from this audio format.",
-                details: audioFile.fileFormat.description
+                details: "fileFormat=\(audioFile.fileFormat), settings=\(audioFile.fileFormat.settings), "
+                    + "processingFormat=\(audioFile.processingFormat), file=\(audioFile.url.lastPathComponent)"
             )
             return
         }
