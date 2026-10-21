@@ -50,20 +50,21 @@ public class WaveformExtractor {
         onExtractionComplete: ([Float]?) -> Void
     ) async -> Void {
         guard let audioFile = audioFile else { return }
-        
+
+        /// Prevent division by zero, + minimum resolution
+        let samplesPerPixel = max(1, samplesPerPixel ?? 100)
+
         /// AVAudioFile can't position or decode files without a fixed frame count per packet, such as Opus in MP4
         /// (Chrome's MediaRecorder output), and `framePosition` raises an Objective-C exception Swift can't catch.
         if audioFile.fileFormat.streamDescription.pointee.mFramesPerPacket == 0 {
-            sendErrorToFlutter(
-                message: "Can't extract waveform data from this audio format.",
-                details: "fileFormat=\(audioFile.fileFormat), settings=\(audioFile.fileFormat.settings), "
-                    + "processingFormat=\(audioFile.processingFormat), file=\(audioFile.url.lastPathComponent)"
+            await extractWaveformWithAssetReader(
+                url: audioFile.url,
+                samplesPerPixel: samplesPerPixel,
+                onExtractionComplete: onExtractionComplete
             )
             return
         }
 
-        /// Prevent division by zero, + minimum resolution
-        let samplesPerPixel = max(1, samplesPerPixel ?? 100)
         let currentFrame = audioFile.framePosition
         let totalFrames = AVAudioFrameCount(audioFile.length)
         var framesPerBuffer = totalFrames / AVAudioFrameCount(samplesPerPixel)
@@ -147,6 +148,91 @@ public class WaveformExtractor {
         let waveformData = await waveformStorage.getData()
         let data = getChannelMean(data: waveformData)
         onExtractionComplete(data);
+    }
+
+    /// Decodes the whole file in order, so it needs neither seeking nor a known duration.
+    private func extractWaveformWithAssetReader(
+        url: URL,
+        samplesPerPixel: Int,
+        onExtractionComplete: ([Float]?) -> Void
+    ) async {
+        guard #available(iOS 15.0, *) else {
+            sendErrorToFlutter(message: "Can't extract waveform data from this audio format before iOS 15.")
+            return
+        }
+
+        let asset = AVURLAsset(url: url)
+        let reader: AVAssetReader
+        let output: AVAssetReaderTrackOutput
+        do {
+            guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
+                sendErrorToFlutter(message: "Audio file has no audio track.", details: url.lastPathComponent)
+                return
+            }
+            reader = try AVAssetReader(asset: asset)
+            output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMIsFloatKey: true,
+                AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false,
+                AVNumberOfChannelsKey: 1,
+            ])
+            reader.add(output)
+        } catch {
+            sendErrorToFlutter(message: "Couldn't open audio track. \(error.localizedDescription)", details: "\(error)")
+            return
+        }
+        guard reader.startReading() else {
+            sendErrorToFlutter(message: "Couldn't read audio track.", details: "\(String(describing: reader.error))")
+            return
+        }
+
+        /// Sums of squares over short blocks, binned into pixels once the total frame count is known.
+        let blockSize = 256
+        var blockSums = [Float]()
+        var blockFrames = [Int]()
+        while let sampleBuffer = output.copyNextSampleBuffer() {
+            if abortGetWaveformData {
+                reader.cancelReading()
+                abortGetWaveformData = false
+                return
+            }
+            guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+            var samples = [Float](repeating: 0, count: CMBlockBufferGetDataLength(blockBuffer) / MemoryLayout<Float>.size)
+            CMBlockBufferCopyDataBytes(
+                blockBuffer,
+                atOffset: 0,
+                dataLength: samples.count * MemoryLayout<Float>.size,
+                destination: &samples
+            )
+            samples.withUnsafeBufferPointer { buffer in
+                for start in stride(from: 0, to: buffer.count, by: blockSize) {
+                    let count = min(blockSize, buffer.count - start)
+                    var sum: Float = 0
+                    vDSP_svesq(buffer.baseAddress! + start, 1, &sum, vDSP_Length(count))
+                    blockSums.append(sum)
+                    blockFrames.append(count)
+                }
+            }
+        }
+
+        let totalFrames = blockFrames.reduce(0, +)
+        guard reader.status == .completed, totalFrames > 0 else {
+            sendErrorToFlutter(message: "Couldn't read audio track.", details: "\(String(describing: reader.error))")
+            return
+        }
+
+        var pixelSums = [Float](repeating: 0, count: samplesPerPixel)
+        var pixelFrames = [Int](repeating: 0, count: samplesPerPixel)
+        var frame = 0
+        for (sum, count) in zip(blockSums, blockFrames) {
+            let pixel = frame * samplesPerPixel / totalFrames
+            pixelSums[pixel] += sum
+            pixelFrames[pixel] += count
+            frame += count
+        }
+        onExtractionComplete(zip(pixelSums, pixelFrames).map { $1 > 0 ? sqrt($0 / Float($1)) : 0 })
     }
 
     func getChannelMean(data: FloatChannelData) -> [Float] {
