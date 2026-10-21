@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "audio_waveforms",
     platforms: [
-        .iOS("13.0"),
+        .iOS("15.0"),
     ],
     products: [
         .library(name: "audio-waveforms", targets: ["audio_waveforms"]),
