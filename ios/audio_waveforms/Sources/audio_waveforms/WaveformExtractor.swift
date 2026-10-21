@@ -156,11 +156,6 @@ public class WaveformExtractor {
         samplesPerPixel: Int,
         onExtractionComplete: ([Float]?) -> Void
     ) async {
-        guard #available(iOS 15.0, *) else {
-            sendErrorToFlutter(message: "Can't extract waveform data from this audio format before iOS 15.")
-            return
-        }
-
         /// The plugin builds scheme-less URLs from plain paths; AVAudioFile accepts them, AVURLAsset doesn't.
         let asset = AVURLAsset(url: URL(fileURLWithPath: url.path))
         let reader: AVAssetReader
