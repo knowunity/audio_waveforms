@@ -161,7 +161,8 @@ public class WaveformExtractor {
             return
         }
 
-        let asset = AVURLAsset(url: url)
+        /// The plugin builds scheme-less URLs from plain paths; AVAudioFile accepts them, AVURLAsset doesn't.
+        let asset = AVURLAsset(url: URL(fileURLWithPath: url.path))
         let reader: AVAssetReader
         let output: AVAssetReaderTrackOutput
         do {
