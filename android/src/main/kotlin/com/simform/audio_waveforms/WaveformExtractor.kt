@@ -47,6 +47,8 @@ class WaveformExtractor(
     private var decoder: MediaCodec? = null
     /** MediaExtractor for reading audio tracks from the file */
     private var extractor: MediaExtractor? = null
+    /** Format of the selected audio track, reported with errors */
+    private var inputFormat: MediaFormat? = null
     /** Duration of the audio file in milliseconds */
     private var durationMillis = 0L
     /** Current extraction progress (0.0 to 1.0) */
@@ -113,6 +115,7 @@ class WaveformExtractor(
             val format = mediaExtractor.getTrackFormat(it)
             val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
             if (mime.contains("audio")) {
+                inputFormat = format
                 durationMillis = format.getLong(MediaFormat.KEY_DURATION) / 1000
                 mediaExtractor.selectTrack(it)
                 return format
@@ -169,7 +172,7 @@ class WaveformExtractor(
                             inputEof = true
                             if (!isReplySubmitted) {
                                 isReplySubmitted = true
-                                result.error(Constants.LOG_TAG, e.message, "Invalid input buffer.")
+                                result.error(Constants.LOG_TAG, e.message, "Invalid input buffer: ${errorDetails(e)}")
                             }
                         }
                       }
@@ -203,7 +206,8 @@ class WaveformExtractor(
                             result.error(
                                 Constants.LOG_TAG,
                                 e.message,
-                                "An error is thrown while decoding the audio file"
+                                "An error is thrown while decoding the audio file: codec=${runCatching { codec.name }.getOrNull()}, " +
+                                    "errorCode=${e.errorCode}, diagnosticInfo=${e.diagnosticInfo}, ${errorDetails(e)}"
                             )
                             isReplySubmitted = true
                         }
@@ -273,7 +277,7 @@ class WaveformExtractor(
                 result.error(
                     Constants.LOG_TAG,
                     e.message,
-                    "An error is thrown before decoding the audio file"
+                    "An error is thrown before decoding the audio file: ${errorDetails(e)}"
                 )
                 isReplySubmitted = true
             }
@@ -281,6 +285,8 @@ class WaveformExtractor(
 
 
     }
+
+    private fun errorDetails(e: Exception) = "exception=${e.javaClass.name}, file=${path.substringAfterLast('/')}, format=$inputFormat"
 
     /** Collected waveform amplitude data points */
     var sampleData = ArrayList<Float>()
