@@ -3,7 +3,6 @@ package com.simform.audio_waveforms
 import android.content.Context
 import android.media.AudioFormat
 import android.media.MediaCodec
-import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.os.Build
 import android.util.Log
@@ -15,6 +14,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.pow
 import kotlin.math.sqrt
 import androidx.core.net.toUri
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.MediaExtractorCompat
 
 /**
  * WaveformExtractor handles the process of extracting amplitude data from audio files
@@ -27,6 +28,7 @@ import androidx.core.net.toUri
  * The extractor supports various audio formats and bit depths (8-bit, 16-bit, and 32-bit)
  * and handles both mono and stereo audio channels.
  */
+@OptIn(UnstableApi::class)
 class WaveformExtractor(
     /** Path to the audio file to analyze */
     private val path: String,
@@ -45,17 +47,10 @@ class WaveformExtractor(
 ) {
     /** MediaCodec for decoding audio data */
     private var decoder: MediaCodec? = null
-    /** MediaExtractor for reading audio tracks from the file */
-    private var extractor: MediaExtractor? = null
+    /** Media3, not the platform MediaExtractor: its Opus header for browser-recorded MP4 is rejected by the Opus decoder */
+    private var extractor: MediaExtractorCompat? = null
     /** Format of the selected audio track, reported with errors */
     private var inputFormat: MediaFormat? = null
-    /** Duration of the audio file in milliseconds */
-    private var durationMillis = 0L
-    /** Current extraction progress (0.0 to 1.0) */
-    private var progress = 0F
-    /** Number of processed chunks */
-    private var currentProgress = 0F
-
     /** Latch for synchronizing completion of the extraction process */
     private val finishCount = CountDownLatch(1)
     /** Flag indicating end of input data */
@@ -66,10 +61,6 @@ class WaveformExtractor(
     private var channels = 1
     /** Bit depth of the audio (8, 16, or 32) */
     private var pcmEncodingBit = 16
-    /** Total number of audio samples */
-    private var totalSamples = 0L
-    /** Number of audio samples per waveform data point */
-    private var perSamplePoints = 0L
     /** Flag to prevent submitting multiple results */
     private var isReplySubmitted = false
     /** Flag to ensure stop is only executed once */
@@ -97,7 +88,6 @@ class WaveformExtractor(
      * 1. Creates a MediaExtractor to read the file
      * 2. Finds the first audio track in the file
      * 3. Retrieves and selects that track
-     * 4. Extracts the audio duration
      *
      * @param path Path to the audio file (content URI format)
      * @return MediaFormat of the audio track, or null if no audio track is found
@@ -106,7 +96,7 @@ class WaveformExtractor(
         if (path.isEmpty()) {
             return null
         }
-        val mediaExtractor = MediaExtractor()
+        val mediaExtractor = MediaExtractorCompat(context)
         this.extractor = mediaExtractor
         val uri = path.toUri()
         mediaExtractor.setDataSource(context, uri, null)
@@ -116,7 +106,6 @@ class WaveformExtractor(
             val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
             if (mime.contains("audio")) {
                 inputFormat = format
-                durationMillis = format.getLong(MediaFormat.KEY_DURATION) / 1000
                 mediaExtractor.selectTrack(it)
                 return format
             }
@@ -196,8 +185,7 @@ class WaveformExtractor(
                         } else {
                             16
                         }
-                        totalSamples = (sampleRate.toLong() * durationMillis) / 1000
-                        perSamplePoints = totalSamples / expectedPoints
+                        windowFrames = (sampleRate / WINDOWS_PER_SECOND).coerceAtLeast(1)
                       }
                     }
 
@@ -260,9 +248,7 @@ class WaveformExtractor(
                         }
 
                         if (info.isEof()) {
-                            updateProgress()
-                            val rms = sqrt(sampleSum / perSamplePoints).toFloat()
-                            sendProgress(rms)
+                            finish()
                             stop()
                         }
                       }
@@ -286,40 +272,43 @@ class WaveformExtractor(
 
     }
 
-    private fun errorDetails(e: Exception) = "exception=${e.javaClass.name}, file=${path.substringAfterLast('/')}, format=$inputFormat"
+    private fun errorDetails(e: Exception) = "exception=${e.javaClass.name}, ${errorDetails()}"
+
+    private fun errorDetails() = "file=${path.substringAfterLast('/')}, format=$inputFormat"
 
     /** Collected waveform amplitude data points */
     var sampleData = ArrayList<Float>()
-    /** Count of samples processed for the current data point */
-    private var sampleCount = 0L
-    /** Sum of squared sample values for RMS calculation */
-    private var sampleSum = 0.0
 
     /**
-     * Processes each audio sample and accumulates data for RMS calculation
-     *
-     * This method:
-     * 1. Accumulates squared sample values
-     * 2. When enough samples are collected for a data point, calculates the RMS
-     * 3. Updates progress and sends the new data point to Flutter
-     * 
-     * @param value The normalized audio sample value (-1.0 to 1.0)
+     * The decoded audio is summed into short fixed windows and only split into [expectedPoints]
+     * bars at the end of the stream, because the container duration can be missing or wrong
+     * (browser-recorded fragmented MP4).
+     */
+    private var windowFrames = 1
+    /** Sum of squared sample values per completed window */
+    private var windowSums = DoubleArray(INITIAL_WINDOW_CAPACITY)
+    private var windowCount = 0
+    private var currentWindowFrames = 0
+    private var currentWindowSum = 0.0
+
+    /**
+     * Accumulates one normalized sample (-1.0 to 1.0) into the current window
      */
     private fun handleBufferDivision(value: Float) {
-        if (sampleCount == perSamplePoints) {
-            updateProgress()
-
-            // Discard redundant values and release resources
-            if (progress > 1.0F) {
-                stop()
-                return
-            }
-            val rms = sqrt(sampleSum / perSamplePoints).toFloat()
-            sendProgress(rms)
+        currentWindowSum += value.toDouble().pow(2.0)
+        currentWindowFrames++
+        if (currentWindowFrames == windowFrames) {
+            appendWindow(currentWindowSum)
+            currentWindowFrames = 0
+            currentWindowSum = 0.0
         }
+    }
 
-        sampleCount++
-        sampleSum += value.toDouble().pow(2.0)
+    private fun appendWindow(sum: Double) {
+        if (windowCount == windowSums.size) {
+            windowSums = windowSums.copyOf(windowSums.size * 2)
+        }
+        windowSums[windowCount++] = sum
     }
 
     /**
@@ -392,32 +381,33 @@ class WaveformExtractor(
     }
 
     /**
-     * Updates the extraction progress
-     * 
-     * Increments the progress counter and calculates the overall
-     * extraction progress as a ratio of current to expected data points.
+     * Splits the decoded windows into [expectedPoints] RMS bars and replies to Flutter once
      */
-    private fun updateProgress() {
-        currentProgress++
-        progress = currentProgress / expectedPoints
-    }
+    private fun finish() {
+        if (isReplySubmitted) return
+        isReplySubmitted = true
 
-    /**
-     * Sends a new waveform data point and current progress to Flutter
-     *
-     * This method:
-     * 1. Adds the new RMS value to the waveform data
-     * 2. Reports the progress via the callback interface
-     * 3. Resets the sample counters for the next data point
-     * 4. Sends the current waveform data and progress to Flutter via the method channel
-     * 
-     * @param rms The calculated RMS value for this data point
-     */
-    private fun sendProgress(rms: Float) {
-        sampleData.add(rms)
+        val lastWindowFrames = if (currentWindowFrames > 0) currentWindowFrames else windowFrames
+        if (currentWindowFrames > 0) appendWindow(currentWindowSum)
+        if (windowCount == 0 || expectedPoints <= 0) {
+            result.error(Constants.LOG_TAG, "No audio decoded", "The audio file has no samples: ${errorDetails()}")
+            return
+        }
+
+        repeat(expectedPoints) { point ->
+            val start = (point.toLong() * windowCount / expectedPoints).toInt()
+            val end = maxOf(start + 1, ((point + 1L) * windowCount / expectedPoints).toInt())
+            var sum = 0.0
+            var frames = 0L
+            for (window in start until end) {
+                sum += windowSums[window]
+                frames += if (window == windowCount - 1) lastWindowFrames else windowFrames
+            }
+            sampleData.add(sqrt(sum / frames).toFloat())
+        }
+
+        val progress = 1F
         extractorCallBack.onProgress(progress)
-        sampleCount = 0
-        sampleSum = 0.0
 
         val args: MutableMap<String, Any?> = HashMap()
         args[Constants.waveformData] = sampleData
@@ -471,6 +461,11 @@ class WaveformExtractor(
         }
 
         finishCount.countDown()
+    }
+
+    private companion object {
+        const val WINDOWS_PER_SECOND = 100
+        const val INITIAL_WINDOW_CAPACITY = 1024
     }
 }
 
