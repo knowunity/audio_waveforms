@@ -55,12 +55,14 @@ class WaveformExtractor(
     private val finishCount = CountDownLatch(1)
     /** Flag indicating end of input data */
     private var inputEof = false
+    /** Media3's FLAC extractor keeps returning the last sample at the end instead of -1, so a repeated time ends the input */
+    private var lastQueuedSampleTimeUs = -1L
     /** Sample rate of the audio in Hz */
     private var sampleRate = 0
     /** Number of audio channels (1=mono, 2=stereo) */
     private var channels = 1
-    /** Bit depth of the audio (8, 16, or 32) */
-    private var pcmEncodingBit = 16
+    /** AudioFormat encoding of the decoded PCM */
+    private var pcmEncoding = AudioFormat.ENCODING_PCM_16BIT
     /** Flag to prevent submitting multiple results */
     private var isReplySubmitted = false
     /** Flag to ensure stop is only executed once */
@@ -139,8 +141,9 @@ class WaveformExtractor(
                             codec.getInputBuffer(index)?.let { buf ->
                                 val size = extractor.readSampleData(buf, 0)
                                 val sampleTime = extractor.sampleTime
-                                if (size > 0 && sampleTime >= 0) {
+                                if (size > 0 && sampleTime > lastQueuedSampleTimeUs) {
                                     codec.queueInputBuffer(index, 0, size, sampleTime, 0)
+                                    lastQueuedSampleTimeUs = sampleTime
                                     extractor.advance()
                                 } else {
                                     codec.queueInputBuffer(
@@ -171,19 +174,13 @@ class WaveformExtractor(
                       synchronized(lock) {
                         sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                         channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        pcmEncodingBit = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                            if (format.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
-                                when (format.getInteger(MediaFormat.KEY_PCM_ENCODING)) {
-                                    AudioFormat.ENCODING_PCM_16BIT -> 16
-                                    AudioFormat.ENCODING_PCM_8BIT -> 8
-                                    AudioFormat.ENCODING_PCM_FLOAT -> 32
-                                    else -> 16
-                                }
-                            } else {
-                                16
-                            }
+                        pcmEncoding = if (
+                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+                            format.containsKey(MediaFormat.KEY_PCM_ENCODING)
+                        ) {
+                            format.getInteger(MediaFormat.KEY_PCM_ENCODING)
                         } else {
-                            16
+                            AudioFormat.ENCODING_PCM_16BIT
                         }
                         windowFrames = (sampleRate / WINDOWS_PER_SECOND).coerceAtLeast(1)
                       }
@@ -219,19 +216,12 @@ class WaveformExtractor(
                                         buf.position(info.offset)
                                         buf.limit(info.offset + info.size)
                                         
-                                        when (pcmEncodingBit) {
-                                            8 -> {
-                                                handle8bit(size, buf)
-                                            }
-                                            16 -> {
-                                                handle16bit(size, buf)
-                                            }
-                                            32 -> {
-                                                handle32bit(size, buf)
-                                            }
-                                            else -> {
-                                                Log.e(Constants.LOG_TAG, "Unsupported PCM encoding bit: $pcmEncodingBit")
-                                            }
+                                        when (pcmEncoding) {
+                                            AudioFormat.ENCODING_PCM_8BIT -> handle8bit(size, buf)
+                                            AudioFormat.ENCODING_PCM_FLOAT -> handleFloat(size, buf)
+                                            ENCODING_PCM_24BIT_PACKED -> handle24bit(size, buf)
+                                            ENCODING_PCM_32BIT -> handle32bitInt(size, buf)
+                                            else -> handle16bit(size, buf)
                                         }
                                     } catch (e: Exception) {
                                         Log.e(Constants.LOG_TAG, "Error processing output buffer: ${e.message}")
@@ -360,16 +350,47 @@ class WaveformExtractor(
     }
 
     /**
+     * Processes 24-bit packed little-endian PCM, which Media3 passes through for 24-bit WAV and FLAC
+     */
+    private fun handle24bit(size: Int, buf: ByteBuffer) {
+        repeat(size / if (channels == 2) 6 else 3) {
+            val low = buf.get().toInt() and 0xFF
+            val mid = buf.get().toInt() and 0xFF
+            val high = buf.get().toInt() shl 16
+            val value = (low or (mid shl 8) or high) / TWENTY_FOUR_BITS
+            if (channels == 2) {
+                buf.get()
+                buf.get()
+                buf.get()
+            }
+            handleBufferDivision(value)
+        }
+    }
+
+    /**
+     * Processes 32-bit signed integer little-endian PCM
+     */
+    private fun handle32bitInt(size: Int, buf: ByteBuffer) {
+        val ints = buf.order(ByteOrder.LITTLE_ENDIAN).asIntBuffer()
+        repeat(size / if (channels == 2) 8 else 4) {
+            val value = ints.get() / Int.MAX_VALUE.toFloat()
+            if (channels == 2) {
+                ints.get()
+            }
+            handleBufferDivision(value)
+        }
+    }
+
+    /**
      * Processes 32-bit float PCM audio data
      *
-     * A pcmEncodingBit of 32 is only ever set for AudioFormat.ENCODING_PCM_FLOAT,
-     * so the samples are IEEE-754 floats already in the range [-1.0, 1.0] and are
+     * The samples are IEEE-754 floats already in the range [-1.0, 1.0] and are
      * read as such, then passed to handleBufferDivision for RMS calculation.
      *
      * @param size Size of the buffer in bytes
      * @param buf ByteBuffer containing the audio data
      */
-    private fun handle32bit(size: Int, buf: ByteBuffer) {
+    private fun handleFloat(size: Int, buf: ByteBuffer) {
         val floats = buf.order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
         repeat(size / if (channels == 2) 8 else 4) {
             val value = floats.get()
@@ -466,6 +487,10 @@ class WaveformExtractor(
     private companion object {
         const val WINDOWS_PER_SECOND = 100
         const val INITIAL_WINDOW_CAPACITY = 1024
+        const val TWENTY_FOUR_BITS = 8388607f
+        /** AudioFormat.ENCODING_PCM_24BIT_PACKED and ENCODING_PCM_32BIT are only public from API 31 */
+        const val ENCODING_PCM_24BIT_PACKED = 21
+        const val ENCODING_PCM_32BIT = 22
     }
 }
 
